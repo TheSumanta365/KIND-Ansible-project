@@ -1,0 +1,108 @@
+---
+- hosts: localhost
+  connection: local
+  vars:
+    cluster_name: "java-cluster"
+
+  tasks:
+    # 1. Verify app directory exists
+    - name: Check if app directory exists
+      stat:
+        path: "{{ playbook_dir }}/../app"
+      register: app_dir
+
+    - name: Fail if app directory missing
+      fail:
+        msg: "App directory not found at {{ playbook_dir }}/../app"
+      when: not app_dir.stat.exists
+
+    # 2. Kind cluster management
+    - name: Check existing Kind clusters
+      command: kind get clusters
+      register: existing_clusters
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create Kind config file
+      copy:
+        dest: "/tmp/kind-config.yaml"
+        content: |
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 80
+              hostPort: 80
+            - containerPort: 443
+              hostPort: 443
+      when: "'java-cluster' not in existing_clusters.stdout"
+
+    - name: Create Kind cluster
+      command: "kind create cluster --name {{ cluster_name }} --config /tmp/kind-config.yaml"
+      when: "'java-cluster' not in existing_clusters.stdout"
+      register: cluster_creation
+      changed_when: cluster_creation.rc == 0
+
+    - name: Set kubeconfig context
+      command: "kubectl config use-context kind-{{ cluster_name }}"
+      when: cluster_creation is defined and cluster_creation.changed
+
+    # 3. Build and deploy application
+    - name: Build Docker image
+      command: "docker build -t java-app:latest ."
+      args:
+        chdir: "{{ playbook_dir }}/../app"
+
+    - name: Load image into Kind
+      command: "kind load docker-image java-app:latest --name {{ cluster_name }}"
+
+    # 4. Kubernetes deployment
+    - name: Deploy application
+      kubernetes.core.k8s:
+        state: present
+        namespace: default
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: java-app
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: java-app
+            template:
+              metadata:
+                labels:
+                  app: java-app
+              spec:
+                containers:
+                - name: java-app
+                  image: java-app:latest
+                  imagePullPolicy: Never
+                  ports:
+                  - containerPort: 8080
+                  resources:
+                    limits:
+                      cpu: "500m"
+                      memory: "512Mi"
+
+    - name: Expose service
+      kubernetes.core.k8s:
+        state: present
+        namespace: default
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: java-app
+            namespace: default
+          spec:
+            type: NodePort
+            selector:
+              app: java-app
+            ports:
+              - port: 80
+                targetPort: 8080
